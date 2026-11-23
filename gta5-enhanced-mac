@@ -1,0 +1,609 @@
+#!/bin/bash
+# Sets up GTA V Enhanced on an Apple silicon Mac with the Rockstar Games Launcher, and starts it.
+#
+#   gta5-enhanced-mac install   download the engine, build it, create the Windows environment and run
+#                               Rockstar's launcher installer
+#   gta5-enhanced-mac play      start the Rockstar Games Launcher; choose Play there
+#
+# Everything lives in ~/Library/Application Support/gta5-enhanced-mac, or in the existing folder that
+# GTA5_ENHANCED_MAC_DATA names (an absolute path).
+#
+# Bash 3.2 (macOS's /bin/bash): no associative arrays, no ${var,,}, no coproc.
+
+set -euo pipefail
+
+stage=""
+watch_dir=""
+watch_pid=""
+watch_loop=""
+
+# --- Pinned downloads: the engine release (Wine 11.13 with MacGames' patches and the fsevents-wake
+# watch, built by this repository's .github/workflows/build-engine.yml; engine/README.md), Sikarugir's
+# template 1.0.15 (the engine's libraries) and 1.0.27 (Apple's D3DMetal 4.0b3).
+engine_release=gta5-wine-11.13-0a2a2901a478-r1
+engine_url=https://github.com/rofrol/gta5-enhanced-mac/releases/download/$engine_release/$engine_release.tar.xz
+engine_sha256=7159cd0a3cedd3b37747fa89917cd84dbbe0eba215f608ba664b0aac06f18d31
+template_url=https://github.com/Sikarugir-App/Wrapper/releases/download/v1.0/Template-1.0.15.tar.xz
+template_sha256=34273bcce885ce5a7fd6937af9ea344bb9961de7d55d6193f7413142e835c8c3
+d3dmetal_url=https://github.com/Sikarugir-App/Wrapper/releases/download/v1.0/Template-1.0.27.tar.xz
+d3dmetal_sha256=dd0778f7b553d63df9b0f4e2cda3f3c6c005aabb75588c84d604afe80cdedbb9
+
+template_member=Template-1.0.15.app/Contents/Frameworks
+d3dmetal_member=Template-1.0.27.app/Contents/SharedSupport/renderer/d3dmetal
+d3dmetal_pack=sikarugir-d3dmetal-4.0b3
+
+# Names how the profile is assembled; a different value rebuilds it and applies it to the prefix again.
+# Change the version with the links, copies, environment or registry.
+marker="gta5-enhanced-v4:$engine_sha256+$template_sha256+$d3dmetal_sha256"
+
+# The engine's links: link (relative to engine/) and target (in the renderer layout link_target
+# resolves). Wine looks for a builtin in the engine's own lib/wine first, so the game gets D3DMetal only
+# through these.
+engine_links="lib/wine/x86_64-unix/atidxx64.so renderer/d3dmetal/external/libd3dshared.dylib
+lib/wine/x86_64-unix/d3d11.so renderer/d3dmetal/external/libd3dshared.dylib
+lib/wine/x86_64-unix/d3d12.so renderer/d3dmetal/external/libd3dshared.dylib
+lib/wine/x86_64-unix/dxgi.so renderer/d3dmetal/external/libd3dshared.dylib
+lib/wine/x86_64-windows/atidxx64.dll renderer/d3dmetal/wine/x86_64-windows/atidxx64.dll
+lib/wine/x86_64-windows/d3d11.dll renderer/d3dmetal/wine/x86_64-windows/d3d11.dll
+lib/wine/x86_64-windows/d3d12.dll renderer/d3dmetal/wine/x86_64-windows/d3d12.dll
+lib/wine/x86_64-windows/dxgi.dll renderer/d3dmetal/wine/x86_64-windows/dxgi.dll"
+
+# The copies in system32: source (relative to the profile) and name in system32, later ones replacing
+# earlier ones: D3DMetal's dxgi, d3d11, d3d12 and the template's atidxx64, then the engine release's
+# WineD3D d3d11, dxgi and d3d10core, which the launcher and Social Club take (native,builtin).
+system_copies="packs/$d3dmetal_pack/wine/x86_64-windows/dxgi.dll dxgi.dll
+packs/$d3dmetal_pack/wine/x86_64-windows/d3d11.dll d3d11.dll
+packs/$d3dmetal_pack/wine/x86_64-windows/d3d12.dll d3d12.dll
+deps/Frameworks/renderer/d3dmetal/wine/x86_64-windows/atidxx64.dll atidxx64.dll
+launcher-wined3d/d3d11.dll d3d11.dll
+launcher-wined3d/dxgi.dll dxgi.dll
+launcher-wined3d/d3d10core.dll d3d10core.dll"
+
+# The registry: Windows 10, high resolution, controllers on, then the per-program overrides, last so they
+# win: the game on D3DMetal's builtins, the launcher and Social Club on WineD3D from system32 without
+# Direct3D 12.
+registry='Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Wine]
+"Version"="win10"
+
+[HKEY_CURRENT_USER\Software\Wine\Mac Driver]
+"RetinaMode"="y"
+
+[HKEY_CURRENT_USER\Software\Wine\X11 Driver]
+"EmulateModeset"="y"
+
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"LogPixels"=dword:000000c0
+
+[HKEY_CURRENT_USER\Software\Wine\Fonts]
+"LogPixels"=dword:000000c0
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\winebus]
+"Enable SDL"=dword:00000001
+"Map Controllers"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\GTA5_Enhanced.exe\DllOverrides]
+"dxgi"="builtin"
+"d3d11"="builtin"
+"d3d10core"="builtin"
+"d3d12"="builtin"
+"atidxx64"="builtin"
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\Launcher.exe\DllOverrides]
+"dxgi"="native,builtin"
+"d3d11"="native,builtin"
+"d3d10core"="native,builtin"
+"d3d12"=""
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\LauncherPatcher.exe\DllOverrides]
+"dxgi"="native,builtin"
+"d3d11"="native,builtin"
+"d3d10core"="native,builtin"
+"d3d12"=""
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\SocialClubHelper.exe\DllOverrides]
+"dxgi"="native,builtin"
+"d3d11"="native,builtin"
+"d3d10core"="native,builtin"
+"d3d12"=""
+"vulkan-1"="native"
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\SocialClubHelper.exe]
+"CommandLineAppend"=-
+
+[HKEY_CURRENT_USER\Software\Wine\Mac Driver]
+"CaptureDisplaysForFullscreen"="y"
+'
+
+# The launcher starts GTA5_Enhanced.exe with @commandline.txt from the game's folder.
+# Without -disableSpatialAudioClient voices and most effects are silent under Wine; -nobattleye skips
+# BattlEye, which is for GTA Online only.
+game_executable=GTA5_Enhanced.exe
+game_arguments="-disableSpatialAudioClient -nobattleye"
+
+# Rockstar's own installer link and the launcher it installs (relative to drive_c).
+installer_url=https://gamedownloads.rockstargames.com/public/installer/Rockstar-Games-Launcher.exe
+installer_name=Rockstar-Games-Launcher.exe
+launcher_executable="Program Files/Rockstar Games/Launcher/LauncherPatcher.exe"
+
+# WINEDLLOVERRIDES: no graphics overrides, so the registry's per-program ones decide.
+dll_overrides="winemenubuilder.exe=;mscoree,mshtml=;gameoverlayrenderer,gameoverlayrenderer64=;nvapi64,nvngx="
+
+# The Windows user MacGames' engine expects; every Wine command here runs under it.
+windows_user=crossover
+user_folders="Desktop Documents Downloads Music Pictures Videos Templates"
+
+die() {
+	echo "gta5-enhanced-mac: $*" >&2
+	exit 1
+}
+
+say() {
+	echo "gta5-enhanced-mac: $*"
+}
+
+usage() {
+	echo "usage: $0 install | $0 play" >&2
+	exit 2
+}
+
+# --- Paths ---------------------------------------------------------------------------------------------
+
+set_paths() {
+	if [ -n "${GTA5_ENHANCED_MAC_DATA:-}" ]; then
+		case $GTA5_ENHANCED_MAC_DATA in
+		/*) ;;
+		*) die "GTA5_ENHANCED_MAC_DATA must be an absolute path" ;;
+		esac
+		# An existing folder only, so a mistyped path creates nothing.
+		[ -d "$GTA5_ENHANCED_MAC_DATA" ] || die "$GTA5_ENHANCED_MAC_DATA is not a folder"
+		data=$GTA5_ENHANCED_MAC_DATA
+	else
+		data="$HOME/Library/Application Support/gta5-enhanced-mac"
+		mkdir -p "$data"
+	fi
+	downloads="$data/downloads"
+	profile="$data/profile"
+	prefix="$data/prefix"
+	drive="$prefix/drive_c"
+	own="$drive/gta5-enhanced-mac"
+	logs="$data/logs"
+	cache="$data/cache"
+}
+
+# One run at a time: a second install or play would race this one's build, prefix or session.
+# shlock writes this process's id and treats a lock whose process has ended as free.
+take_lock() {
+	lock="$data/.lock"
+	shlock -f "$lock" -p $$ || die "another gta5-enhanced-mac install or play is running (lock $lock)"
+	trap 'end_watch; rm -f "$lock"; [ -z "${stage:-}" ] || rm -rf "$stage"' EXIT
+	# An exit by a signal runs the EXIT trap too.
+	trap 'exit 130' INT
+	trap 'exit 143' TERM HUP
+}
+
+# --- Wine ----------------------------------------------------------------------------------------------
+
+# Runs a command in the profile's environment: the Mac's environment with Wine's and the renderers'
+# variables removed, then the engine's.
+in_wine_env() (
+	for name in $(compgen -e); do
+		case $name in
+		WINE* | CX_* | DYLD_* | DXMT_* | DXVK_* | D3DM_* | GST_* | ROSETTA_* | MTL_* | SDL_*) unset "$name" ;;
+		esac
+	done
+	gst="$profile/deps/Frameworks/GStreamer.framework/Versions/1.0/lib"
+	export PATH="$profile/engine/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	export WINEPREFIX="$prefix"
+	export WINEARCH=win64
+	# MacGames' GTA V environment turns msync off; the game was tested that way.
+	export WINEMSYNC=0
+	export WINEESYNC=0
+	export WINEDLLOVERRIDES="$dll_overrides"
+	export WINEDLLPATH="$profile/packs/$d3dmetal_pack/wine:$profile/engine/lib/wine"
+	export WINEDEBUG=-all,err+all
+	export DYLD_FALLBACK_LIBRARY_PATH="$profile/deps/Frameworks:$gst:/usr/lib"
+	export GST_PLUGIN_PATH="$gst/gstreamer-1.0"
+	export GST_REGISTRY="$cache/gstreamer-registry-gta5-enhanced.bin"
+	export CX_APPLEGPTK_LIBD3DSHARED_PATH="$profile/packs/$d3dmetal_pack/external/libd3dshared.dylib"
+	export ROSETTA_ADVERTISE_AVX=1
+	export MTL_HUD_ENABLED=0
+	export D3DM_ENABLE_METALFX=0
+	# Read by the engine's patches: Social Club's browser draws on the CPU.
+	export GTM_ROCKSTAR_SWIFTSHADER=1
+	export USER=$windows_user
+	export LOGNAME=$windows_user
+	exec "$@"
+)
+
+# Whether a Wine server runs for the prefix: wineserver -k0 exits 0 when one does, 1 when none does.
+wine_running() {
+	[ -x "$profile/engine/bin/wineserver" ] || return 1
+	local status=0
+	in_wine_env wineserver -k0 >/dev/null 2>&1 || status=$?
+	case $status in
+	0) return 0 ;;
+	1) return 1 ;;
+	*) die "could not check whether Wine runs in $prefix (wineserver -k0 exited with $status)" ;;
+	esac
+}
+
+# Waits until every Wine process of the prefix has ended (Wine writes the registry files then).
+wait_for_wine() {
+	in_wine_env wineserver -w
+}
+
+# --- Downloads -----------------------------------------------------------------------------------------
+
+sha256_of() {
+	shasum -a 256 "$1" | awk '{ print $1 }'
+}
+
+# fetch URL SHA256: downloads into $downloads unless a file with that hash is there; prints its path.
+fetch() {
+	local url=$1 sum=$2 file
+	file="$downloads/${url##*/}"
+	if [ -f "$file" ] && [ "$(sha256_of "$file")" = "$sum" ]; then
+		echo "$file"
+		return
+	fi
+	# Called in $(...), where bash does not stop on errors: every step checks its own.
+	mkdir -p "$downloads" || die "could not create $downloads"
+	say "downloading $url" >&2
+	curl -fL --proto '=https' --progress-bar -o "$file.part" "$url" || die "download failed: $url"
+	local got
+	got=$(sha256_of "$file.part")
+	if [ "$got" != "$sum" ]; then
+		rm -f "$file.part"
+		die "${url##*/} has SHA-256 $got, expected $sum"
+	fi
+	mv -f "$file.part" "$file" || die "could not move ${url##*/} into $downloads"
+	echo "$file"
+}
+
+# --- The engine profile --------------------------------------------------------------------------------
+
+profile_ready() {
+	[ "$(cat "$profile/.marker" 2>/dev/null || true)" = "$marker" ]
+}
+
+# A D3DMetal file from the pinned D3DMetal pack when the pack has it (its DLLs
+# and libd3dshared must come from one D3DMetal), otherwise the template's file.
+link_target() {
+	local root=$1 target=$2 rest
+	case $target in
+	renderer/d3dmetal/*)
+		rest=${target#renderer/d3dmetal/}
+		if [ -e "$root/packs/$d3dmetal_pack/$rest" ]; then
+			echo "packs/$d3dmetal_pack/$rest"
+			return
+		fi
+		;;
+	esac
+	echo "deps/Frameworks/$target"
+}
+
+# Unpacked and linked in a staging folder, checked, then moved into place.
+build_profile() {
+	profile_ready && return
+	local engine_archive template_archive d3dmetal_archive
+	engine_archive=$(fetch "$engine_url" "$engine_sha256")
+	template_archive=$(fetch "$template_url" "$template_sha256")
+	d3dmetal_archive=$(fetch "$d3dmetal_url" "$d3dmetal_sha256")
+	say "building the engine in $profile"
+	# Left by an interrupted build; no other run can be using them while this one holds the lock.
+	rm -rf "$data"/.staging.* "$data"/.old-profile.*
+	stage=$(mktemp -d "$data/.staging.XXXXXX")
+	local sources="$stage/.sources"
+	mkdir -p "$sources" "$stage/deps" "$stage/packs"
+	tar -xf "$engine_archive" -C "$stage" engine launcher-wined3d tools/fsevents-wake
+	tar -xf "$template_archive" -C "$sources" "$template_member"
+	mv "$sources/$template_member" "$stage/deps/Frameworks"
+	tar -xf "$d3dmetal_archive" -C "$sources" "$d3dmetal_member"
+	mv "$sources/$d3dmetal_member" "$stage/packs/$d3dmetal_pack"
+	# link_target falls back to the template's own (older) D3DMetal for a file the pack lacks, so a pack
+	# without D3DMetal's Unix side would mix versions silently.
+	[ -f "$stage/packs/$d3dmetal_pack/external/libd3dshared.dylib" ] || die "$d3dmetal_member has an unexpected layout"
+	local relative target destination link up
+	while read -r relative target; do
+		link="$stage/engine/$relative"
+		[ ! -d "$link" ] || [ -L "$link" ] || die "the engine has a folder at $relative"
+		rm -f "$link"
+		destination=$(link_target "$stage" "$target")
+		[ -e "$stage/$destination" ] || die "the profile lacks $target"
+		mkdir -p "${link%/*}"
+		# Relative, so the profile can move from the staging folder into place.
+		up=$(echo "engine/$relative" | awk -F/ '{ for (i = 1; i < NF; i++) printf "../" }')
+		ln -s "$up$destination" "$link"
+	done <<EOF
+$engine_links
+EOF
+	rm -rf "$sources"
+	local from name
+	while read -r from name; do
+		[ -f "$stage/$from" ] || die "the profile lacks $from for system32"
+	done <<EOF
+$system_copies
+EOF
+	[ -x "$stage/tools/fsevents-wake" ] || die "the engine release lacks tools/fsevents-wake"
+	mkdir -p "$logs"
+	"$stage/engine/bin/wine" --version >>"$logs/setup.log" 2>&1 || die "the engine does not run (see $logs/setup.log)"
+	echo "$marker" >"$stage/.marker"
+	# The profile it replaces goes aside first and comes back if the new one cannot move into place.
+	local old=""
+	if [ -e "$profile" ]; then
+		old="$data/.old-profile.$$"
+		mv "$profile" "$old"
+	fi
+	if ! mv "$stage" "$profile"; then
+		[ -z "$old" ] || mv "$old" "$profile"
+		die "could not move the engine into $profile"
+	fi
+	stage=""
+	[ -z "$old" ] || rm -rf "$old"
+}
+
+# --- The prefix ----------------------------------------------------------------------------------------
+
+# Wine links a profile's Desktop, Documents and the other user folders to the Mac user's folders of the
+# same kind whenever one is missing. These replace every link under drive_c/users with an empty folder
+# and remove drive Z: (all of the Mac's disk), so
+# nothing in the prefix writes into ~/Documents or elsewhere in the Mac's home folder.
+make_user_folders() {
+	local folder
+	for folder in $user_folders; do
+		mkdir -p "$drive/users/$windows_user/$folder"
+	done
+}
+
+isolate_user_folders() {
+	local link
+	find "$drive/users" -type l -print0 | while IFS= read -r -d '' link; do
+		rm -f "$link"
+		mkdir -p "$link"
+	done
+	if [ -L "$prefix/dosdevices/z:" ]; then rm -f "$prefix/dosdevices/z:"; fi
+	# Again, for a folder whose link an interrupted run removed before making it a folder.
+	make_user_folders
+}
+
+# Refuses to start a program while anything under drive_c/users links out of the prefix, or drive Z: is
+# there.
+check_user_folders() {
+	local links
+	[ -d "$drive/users" ] || die "$drive/users is missing"
+	links=$(find "$drive/users" -type l)
+	[ -z "$links" ] || die "links under $drive/users would let Windows programs write to the Mac's folders: $links"
+	local folder
+	for folder in $user_folders; do
+		# A missing one, Wine would link to the Mac's folder of that kind.
+		[ -d "$drive/users/$windows_user/$folder" ] || die "$drive/users/$windows_user/$folder is missing: run install"
+	done
+	[ ! -e "$prefix/dosdevices/z:" ] && [ ! -L "$prefix/dosdevices/z:" ] || die "$prefix has drive Z:"
+}
+
+# A new prefix booted as user crossover, drive Y: to
+# the profile (Wine's Gecko and Mono load through a Windows path to the engine's data), the system32
+# copies, then the registry; the marker records that the profile's files and registry are applied.
+prepare_prefix() {
+	mkdir -p "$logs" "$cache"
+	# Not ready until the boot, the files and the registry below are all in place: play refuses meanwhile.
+	rm -f "$own/engine-profile"
+	# Recorded once wineboot has finished, so an interrupted first boot runs again (wineboot -u only
+	# completes what a prefix lacks).
+	if [ ! -f "$prefix/.gta5-enhanced-mac-booted" ]; then
+		say "creating the Windows environment in $prefix"
+		mkdir -p "$prefix"
+		make_user_folders
+		(cd "$drive" && in_wine_env wineboot -u) >>"$logs/setup.log" 2>&1 || die "wineboot failed (see $logs/setup.log)"
+		wait_for_wine
+		touch "$prefix/.gta5-enhanced-mac-booted"
+	fi
+	isolate_user_folders
+	ln -sfn "$profile" "$prefix/dosdevices/y:"
+	local from name system32="$drive/windows/system32"
+	while read -r from name; do
+		rm -f "$system32/$name"
+		cp "$profile/$from" "$system32/$name"
+	done <<EOF
+$system_copies
+EOF
+	mkdir -p "$own"
+	printf '%s' "$registry" >"$own/profile.reg"
+	(cd "$drive" && in_wine_env wine reg import 'C:\gta5-enhanced-mac\profile.reg') >>"$logs/setup.log" 2>&1 ||
+		die "the registry import failed (see $logs/setup.log)"
+	wait_for_wine
+	echo "$marker" >"$own/engine-profile"
+}
+
+prefix_ready() {
+	[ "$(cat "$own/engine-profile" 2>/dev/null || true)" = "$marker" ]
+}
+
+# --- The game's arguments ------------------------------------------------------------------------------
+
+# Adds the arguments to commandline.txt in a folder of the prefix that holds the game, each once,
+# keeping the user's, through a file renamed into place, so the game never reads half of one. A
+# commandline.txt that is a link, unreadable, has NUL bytes (UTF-16) or is not UTF-8 is left as it is.
+# Each step that can fail is checked here: the watch's loop runs it without errexit.
+write_arguments_in() {
+	local folder resolved real_prefix file input merged
+	folder=$1
+	resolved=$(cd -P -- "$folder" 2>/dev/null && pwd) || return 0
+	real_prefix=$(cd -P -- "$prefix" && pwd) || return 1
+	case $resolved/ in
+	"$real_prefix"/*) ;;
+	*) return 0 ;;
+	esac
+	[ -f "$resolved/$game_executable" ] || return 0
+	file="$resolved/commandline.txt"
+	[ ! -L "$file" ] || return 0
+	if [ -e "$file" ]; then
+		[ -f "$file" ] && [ -r "$file" ] || return 0
+		[ "$(LC_ALL=C tr -d '\000' <"$file" | wc -c)" -eq "$(wc -c <"$file")" ] || return 0
+		iconv -f UTF-8 -t UTF-8 "$file" >/dev/null 2>&1 || return 0
+	fi
+	input=/dev/null
+	[ ! -e "$file" ] || input=$file
+	merged=$(mktemp "$resolved/.commandline.XXXXXX") || return 1
+	awk -v args="$game_arguments" '
+		{
+			gsub(/^[ \t\r]+|[ \t\r]+$/, "")
+			if ($0 == "") next
+			lines[++n] = $0
+			m = split($0, words, " ")
+			for (i = 1; i <= m; i++) present[tolower(words[i])] = 1
+		}
+		END {
+			k = split(args, wanted, " ")
+			for (i = 1; i <= k; i++) if (!(tolower(wanted[i]) in present)) lines[++n] = wanted[i]
+			for (i = 1; i <= n; i++) print lines[i]
+		}
+	' "$input" >"$merged" || { rm -f "$merged"; return 1; }
+	if [ -e "$file" ] && cmp -s "$merged" "$file"; then
+		rm -f "$merged"
+	else
+		mv -f "$merged" "$file" || { rm -f "$merged"; return 1; }
+	fi
+}
+
+# Every folder of the prefix that holds the game: the default one or any other the user chose in the
+# launcher. Links are not followed (a drive letter or folder linked out of the prefix is not searched),
+# and write_arguments_in writes only inside the prefix.
+write_game_arguments() {
+	local executable
+	{ find -H "$prefix" -type f -iname "$game_executable" -print0 2>/dev/null || true; } |
+		while IFS= read -r -d '' executable; do
+			write_arguments_in "${executable%/*}"
+		done
+}
+
+# While a launcher session runs, the launcher can install the game (its first Play then comes in the
+# same session) or move it: tools/fsevents-wake reports each change in the prefix that can concern the
+# game's files, and a write pass follows each report before it is acknowledged. Its first line, "ready",
+# comes once it watches, so the pass after it covers whatever changed before. Each Wine session runs
+# between start_watch and stop_watch; Wine does not inherit the watch's descriptors.
+start_watch() {
+	watch_dir=$(mktemp -d "$data/.watch.XXXXXX")
+	mkfifo "$watch_dir/wake" "$watch_dir/ack"
+	# One simple command, so $! is the watch itself. It opens wake, then ack, as this shell does below.
+	"$profile/tools/fsevents-wake" "$prefix" >"$watch_dir/wake" <"$watch_dir/ack" 2>>"$logs/session.log" &
+	watch_pid=$!
+	exec 3<"$watch_dir/wake" 4>"$watch_dir/ack"
+	local line=""
+	read -r line <&3 || true
+	if [ "$line" != ready ]; then
+		exec 3<&- 4>&-
+		die "could not watch $prefix for the game's files (see $logs/session.log)"
+	fi
+	write_game_arguments
+	echo >&4
+	# A failed pass does not end the loop (the next report, or stop_watch's pass, tries again); the loop
+	# ends when the watch does.
+	(
+		set +e
+		while read -r line <&3; do
+			write_game_arguments
+			echo 2>/dev/null >&4 || exit 0
+		done
+	) &
+	watch_loop=$!
+	exec 3<&- 4>&-
+}
+
+# Ends the watch (and the loop with it, which finishes the pass it may be in), then writes once more for
+# what changed since its last report.
+stop_watch() {
+	if ! kill -0 "$watch_pid" 2>/dev/null; then
+		say "the watch of $prefix ended before the session did (see $logs/session.log); writing the game's arguments once more"
+	fi
+	end_watch
+	write_game_arguments
+}
+
+end_watch() {
+	[ -n "${watch_dir:-}" ] || return 0
+	[ -z "$watch_pid" ] || kill "$watch_pid" 2>/dev/null || true
+	[ -z "$watch_pid" ] || wait "$watch_pid" 2>/dev/null || true
+	[ -z "$watch_loop" ] || wait "$watch_loop" 2>/dev/null || true
+	rm -rf "$watch_dir"
+	watch_dir=""
+	watch_pid=""
+	watch_loop=""
+}
+
+# --- Commands ------------------------------------------------------------------------------------------
+
+check_mac() {
+	[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || die "this needs an Apple silicon Mac"
+	[ -e /Library/Apple/usr/libexec/oah/libRosettaRuntime ] ||
+		die "Rosetta 2 is not installed: run softwareupdate --install-rosetta, accept Apple's licence, then run this again"
+}
+
+install() {
+	check_mac
+	set_paths
+	take_lock
+	if wine_running; then die "Wine runs in $prefix: quit the Rockstar Games Launcher, then run install again"; fi
+	local free_kb
+	free_kb=$(df -Pk "$data" | awk 'NR == 2 { print $4 }')
+	[ "$free_kb" -gt 2000000 ] || die "free at least 2 GB in $data first"
+	build_profile
+	prepare_prefix
+	if [ -f "$drive/$launcher_executable" ]; then
+		write_game_arguments
+		say "the Rockstar Games Launcher is installed; start it with: $0 play"
+		return
+	fi
+	say "downloading Rockstar's launcher installer from $installer_url"
+	curl -fL --proto '=https' --progress-bar -o "$own/$installer_name.part" "$installer_url" ||
+		die "download failed: $installer_url"
+	# A Windows program starts with MZ.
+	if [ "$(head -c 2 "$own/$installer_name.part")" != MZ ]; then
+		rm -f "$own/$installer_name.part"
+		die "Rockstar returned something other than a Windows program; run install again"
+	fi
+	mv -f "$own/$installer_name.part" "$own/$installer_name"
+	check_user_folders
+	say "running the installer: keep its folder. When the launcher opens, sign in, install GTA V Enhanced and"
+	say "choose Play; later, start the launcher with: $0 play"
+	say "(Wine's messages go to $logs/session.log)"
+	local status=0
+	start_watch
+	(cd "$own" && in_wine_env wine "C:\\gta5-enhanced-mac\\$installer_name") >>"$logs/session.log" 2>&1 || status=$?
+	# The installer can start the launcher, which outlives it: the session, not the installer, is what ends.
+	wait_for_wine
+	stop_watch
+	[ -f "$drive/$launcher_executable" ] ||
+		die "the Rockstar Games Launcher was not installed (the installer exited with $status; see $logs/session.log)"
+	say "done; start the launcher with: $0 play"
+}
+
+play() {
+	check_mac
+	set_paths
+	take_lock
+	if ! profile_ready || ! prefix_ready; then die "the engine is missing or older than this script: run $0 install"; fi
+	[ -f "$drive/$launcher_executable" ] || die "the Rockstar Games Launcher is not installed: run $0 install"
+	if wine_running; then die "Wine already runs in $prefix: the launcher is open, or quit it and run play again"; fi
+	check_user_folders
+	say "starting the Rockstar Games Launcher (Wine's messages go to $logs/session.log)"
+	local status=0
+	start_watch
+	(cd "$drive/${launcher_executable%/*}" && in_wine_env wine "C:\\${launcher_executable//\//\\}") >>"$logs/session.log" 2>&1 || status=$?
+	# Launchers restart themselves after updating, so the session, not the first process, is what ends.
+	wait_for_wine
+	stop_watch
+	[ "$status" -eq 0 ] || say "the launcher's first process exited with $status (see $logs/session.log)"
+}
+
+# Sourced (by tests/test.sh), it sets its shell options and defines the above.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	[ $# -eq 1 ] || usage
+	case $1 in
+	install) install ;;
+	play) play ;;
+	*) usage ;;
+	esac
+fi
